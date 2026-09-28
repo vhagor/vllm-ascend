@@ -329,6 +329,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_embed(token_ids)
 
+    def compute_local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project onto this rank's vocabulary without gathering full logits."""
+        processor = self.logits_processor
+        logits = processor._apply_head(self.lm_head, self.model.norm(hidden_states), None)
+        if processor.soft_cap is not None:
+            logits = torch.tanh(logits / processor.soft_cap) * processor.soft_cap
+        if processor.scale != 1.0:
+            logits *= processor.scale
+        return logits
+
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_bias(markov_embed)
 

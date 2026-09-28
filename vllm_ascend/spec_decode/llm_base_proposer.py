@@ -56,6 +56,7 @@ from vllm_ascend.models.kimi_k3_dspark import K3DSparkForCausalLM
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.dspark_local_argmax import sample_local_draft_tokens
 from vllm_ascend.spec_decode.utils import (
     SlidingWindowAdapter,
     _disable_flash_comm_v1_context,
@@ -462,6 +463,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         with self.maybe_eager_context:
             self.model = self._get_model()
+
+        if self.use_local_argmax_reduction and self.method == "dspark":
+            if not isinstance(self.model, DSparkDeepseekV4ForCausalLM):
+                raise ValueError("Ascend DSpark local argmax currently supports DeepSeek V4 only")
+            if lmhead_tp_enable():
+                raise ValueError("DSpark local argmax does not support a separate LMHead TP group")
+            logger.info("DSpark local argmax enabled: Markov-corrected vocabulary-shard candidates")
 
         self._maybe_anti_rotate_fc()
 
@@ -1419,6 +1427,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # `markov_emb` should also be full to match it.
                 # We changed `flash_comm_v1_enabled` to avoid `markov_emb` from being split.
                 with _disable_flash_comm_v1_context():
+                    if self.use_local_argmax_reduction:
+                        local_logits = self.model.compute_local_logits(sample_hidden_states)
+                        local_logits = local_logits.view(-1, self.num_speculative_tokens, local_logits.shape[-1])
+                        group = get_tp_group()
+                        return sample_local_draft_tokens(
+                            local_logits,
+                            self._dspark_seed_buffer[: local_logits.shape[0]],
+                            lambda tokens: self.model.markov_bias(self.model.markov_embed(tokens)),
+                            self.model.lm_head.shard_indices.org_vocab_start_index,
+                            self.model.config.vocab_size,
+                            group.world_size,
+                            lambda pairs: group.all_gather(pairs, dim=-1),
+                        )
                     raw_logits = self.model.compute_logits(sample_hidden_states)
                     if lmhead_tp_enable():
                         # Keep the padded shape through the LMHead TP collective,
